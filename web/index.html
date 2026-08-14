@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Deepnest Web — nesting for laser and CNC</title>
+    <meta
+      name="description"
+      content="Deepnest in the browser: import DXF, DWG, STEP and SVG, pick your material and sheet size, and nest parts for laser and CNC cutting."
+    />
+
+    <!-- Inlined so the page makes no request for it at all. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%231e2128'/%3E%3Cpath d='M6 6h9v9H6zM17 6h9v6h-9zM6 17h6v9H6zM14 17h12v9H14z' fill='none' stroke='%234f9cf9' stroke-width='2'/%3E%3C/svg%3E"
+    />
+
+    <!--
+      Deepnest's nesting core. These are classic scripts, not modules: each is
+      wrapped in an IIFE that takes the global object as `this`, which is
+      undefined inside a module. They are copied verbatim from ../main by
+      scripts/sync-core.mjs so the browser and desktop builds share one
+      geometry implementation.
+    -->
+    <script src="vendor/util-pathsegpolyfill.js"></script>
+    <script src="vendor/util-clipper.js"></script>
+    <script src="vendor/util-matrix.js"></script>
+    <script src="vendor/util-geometryutil.js"></script>
+    <script src="vendor/util-simplify.js"></script>
+    <script src="vendor/util-hull.js"></script>
+    <script src="vendor/util-d3-polygon.js"></script>
+    <script src="vendor/svgparser.js"></script>
+
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">Deepnest</span>
+        <span class="brand-sub">Web</span>
+      </div>
+
+      <div class="topbar-actions">
+        <button id="nest-start" class="btn btn-primary" type="button">
+          Start nest
+        </button>
+        <button id="nest-stop" class="btn" type="button" disabled>Stop</button>
+        <button id="export-svg" class="btn" type="button" disabled>
+          Export SVG
+        </button>
+        <button id="export-dxf" class="btn" type="button" disabled>
+          Export DXF
+        </button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <!-- Parts ------------------------------------------------------ -->
+      <section class="panel panel-parts">
+        <div class="panel-head">
+          <h2>Parts</h2>
+          <button id="import-btn" class="btn btn-small" type="button">
+            Import
+          </button>
+        </div>
+
+        <div id="dropzone" class="dropzone">
+          <p class="dropzone-title">Drop CAD files here</p>
+          <p class="dropzone-hint">SVG · DXF · DWG · STEP · IGES</p>
+          <input
+            id="file-input"
+            type="file"
+            multiple
+            accept=".svg,.dxf,.dwg,.step,.stp,.iges,.igs"
+            hidden
+          />
+        </div>
+
+        <div id="parts-list" class="parts-list" role="list"></div>
+
+        <p id="parts-empty" class="empty-note">
+          No parts yet. Import a file to begin.
+        </p>
+      </section>
+
+      <!-- Material --------------------------------------------------- -->
+      <section class="panel panel-material">
+        <div class="panel-head">
+          <h2>Material</h2>
+          <div class="unit-toggle" role="group" aria-label="Display units">
+            <button
+              type="button"
+              class="unit-btn is-active"
+              data-unit="mm"
+            >
+              mm
+            </button>
+            <button type="button" class="unit-btn" data-unit="inch">in</button>
+          </div>
+        </div>
+
+        <label class="field">
+          <span class="field-label">Stock</span>
+          <select id="material-select" class="input"></select>
+        </label>
+
+        <div class="field-row">
+          <label class="field">
+            <span class="field-label">Thickness</span>
+            <input
+              id="material-thickness"
+              class="input"
+              type="number"
+              min="0"
+              step="0.1"
+            />
+          </label>
+          <label class="field">
+            <span class="field-label">Kerf</span>
+            <input
+              id="material-kerf"
+              class="input"
+              type="number"
+              min="0"
+              step="0.05"
+            />
+          </label>
+        </div>
+
+        <div class="field-row">
+          <label class="field">
+            <span class="field-label">Sheet width</span>
+            <input
+              id="material-width"
+              class="input"
+              type="number"
+              min="1"
+              step="1"
+            />
+          </label>
+          <label class="field">
+            <span class="field-label">Sheet height</span>
+            <input
+              id="material-height"
+              class="input"
+              type="number"
+              min="1"
+              step="1"
+            />
+          </label>
+        </div>
+
+        <label class="field">
+          <span class="field-label">
+            Part spacing
+            <span
+              class="hint"
+              title="Gap left between parts. Set this to at least your kerf width."
+              >?</span
+            >
+          </span>
+          <input
+            id="material-spacing"
+            class="input"
+            type="number"
+            min="0"
+            step="0.5"
+          />
+        </label>
+
+        <div class="button-row">
+          <button id="material-save" class="btn btn-small" type="button">
+            Save as new
+          </button>
+          <button id="material-delete" class="btn btn-small btn-danger" type="button">
+            Delete
+          </button>
+        </div>
+
+        <details class="advanced">
+          <summary>Nesting options</summary>
+
+          <label class="field">
+            <span class="field-label">Rotations</span>
+            <select id="opt-rotations" class="input">
+              <option value="1">None (0°)</option>
+              <option value="2">2 (0°, 180°)</option>
+              <option value="4" selected>4 (90° steps)</option>
+              <option value="8">8 (45° steps)</option>
+            </select>
+          </label>
+
+          <label class="field checkbox">
+            <input id="opt-holes" type="checkbox" />
+            <span>Place parts inside holes of other parts</span>
+          </label>
+
+          <label class="field checkbox">
+            <input id="opt-concave" type="checkbox" />
+            <span>Explore concave regions (slower, tighter)</span>
+          </label>
+        </details>
+      </section>
+
+      <!-- Nest ------------------------------------------------------- -->
+      <section class="panel panel-nest">
+        <div class="panel-head">
+          <h2>Nest</h2>
+          <div id="nest-stats" class="stats"></div>
+        </div>
+
+        <div id="nest-view" class="nest-view">
+          <p class="empty-note">
+            Import parts, choose a material, then press
+            <strong>Start nest</strong>.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <div id="messages" class="messages" role="status" aria-live="polite"></div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

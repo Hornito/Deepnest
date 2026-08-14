@@ -1,0 +1,26 @@
+{
+  "name": "deepnest-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Deepnest in the browser - nesting for laser/CNC with DXF, DWG and STEP import",
+  "scripts": {
+    "sync-core": "node scripts/sync-core.mjs",
+    "predev": "npm run sync-core",
+    "dev": "vite",
+    "prebuild": "npm run sync-core",
+    "build": "vite build",
+    "preview": "vite preview --port 4173",
+    "pretest": "npm run sync-core",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1",
+    "vite": "^5.4.11"
+  },
+  "dependencies": {
+    "@mlightcad/libredwg-web": "^0.7.9",
+    "dxf-parser": "^1.1.2",
+    "occt-import-js": "^0.0.23"
+  }
+}
