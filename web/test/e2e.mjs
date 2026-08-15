@@ -10,7 +10,8 @@
  */
 
 import { chromium } from 'playwright';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const BASE = process.argv[2] || 'http://localhost:4173';
 
@@ -258,7 +259,11 @@ for (const [button, extension] of [
   }
 }
 
-// --- no console errors --------------------------------------------------
+// --- console must be clean for the whole nest/export path ---------------
+// Checked here rather than at the very end: the WASM importer tests below
+// deliberately feed a corrupt file in, and Emscripten logs its own diagnostics
+// to console.error when it rejects one. Those are expected, so the strict
+// check covers everything up to this point.
 const realErrors = consoleErrors.filter(
   // favicon 404s are noise, not failures
   (e) => !/favicon/i.test(e)
@@ -267,6 +272,112 @@ check(
   'no console errors during the run',
   realErrors.length === 0,
   realErrors.slice(0, 3).join(' | ')
+);
+
+// --- STEP import, through the real WASM ---------------------------------
+// The unit tests exercise the projection maths directly, but they cannot
+// prove the 7.6MB OpenCascade build actually loads: it is fetched through an
+// injected <script> tag and resolves its own .wasm sibling, which is exactly
+// the arrangement bundlers tend to break. So load a real STEP solid of known
+// size and check the part that comes out.
+const stepFixture = join(
+  'node_modules',
+  'occt-import-js',
+  'test',
+  'testfiles',
+  'cube-10x10mm',
+  'Cube 10x10.stp'
+);
+
+if (existsSync(stepFixture)) {
+  const partsBefore = await page.locator('.part').count();
+
+  await page.setInputFiles('#file-input', {
+    name: 'cube.step',
+    mimeType: 'application/step',
+    buffer: readFileSync(stepFixture),
+  });
+
+  // Loading and instantiating OpenCascade takes a moment on first use.
+  await page
+    .waitForFunction(
+      (before) => document.querySelectorAll('.part').length > before,
+      partsBefore,
+      { timeout: 120000 }
+    )
+    .catch(() => {});
+
+  const partsAfter = await page.locator('.part').count();
+  check('STEP import produces a part', partsAfter === partsBefore + 1, `${partsAfter} part(s)`);
+
+  if (partsAfter > partsBefore) {
+    const stepDims = await page.locator('.part-dims').last().textContent();
+    // A 10mm cube must project to a 10x10mm square. Getting the plane wrong
+    // gives 14.14mm (the face diagonal), which is the failure this catches.
+    check(
+      'STEP part projects to its true 10x10mm size',
+      /\b10(\.\d)?mm\b/.test(stepDims || '') &&
+        !/14\.1/.test(stepDims || ''),
+      stepDims?.trim()
+    );
+  }
+} else {
+  check('STEP fixture available', false, `missing ${stepFixture}`);
+}
+
+// --- DWG reader loads and fails safely ----------------------------------
+// No DWG fixture ships with LibreDWG, and its WASM build is read-only so one
+// cannot be synthesised here. What can still be verified is the part this
+// repo owns: that the reader loads at all, and that a file it cannot read
+// produces an actionable message instead of an unhandled rejection. The
+// DWG->DXF conversion itself is LibreDWG's and is tested upstream.
+const errorsBeforeDwg = consoleErrors.length;
+
+await page.setInputFiles('#file-input', {
+  name: 'broken.dwg',
+  mimeType: 'image/vnd.dwg',
+  // A plausible DWG magic followed by noise: enough to get past extension
+  // dispatch and into the reader.
+  buffer: Buffer.concat([
+    Buffer.from('AC1027', 'ascii'),
+    Buffer.alloc(512, 0x7f),
+  ]),
+});
+
+// Pull out the one message about this file rather than scanning the whole
+// panel, which still holds the DXF and STEP notices from earlier.
+const dwgMessage = await page
+  .waitForFunction(
+    () => {
+      const node = [...document.querySelectorAll('#messages .message')].find(
+        (m) => m.textContent.includes('broken.dwg')
+      );
+      return node ? node.textContent.replace(/^×\s*/, '') : null;
+    },
+    undefined,
+    { timeout: 120000 }
+  )
+  .then((handle) => handle.jsonValue())
+  .catch(() => null);
+
+check(
+  'DWG reader loads and reports a corrupt file clearly',
+  // Must name the file and say something the user can act on, not just fail.
+  typeof dwgMessage === 'string' &&
+    /broken\.dwg/i.test(dwgMessage) &&
+    /corrupt|newer format|could not/i.test(dwgMessage),
+  dwgMessage ? dwgMessage.replace(/\s+/g, ' ').slice(0, 140) : 'no message shown'
+);
+
+// Whatever Emscripten logged, the page itself must still be alive and must
+// not have thrown an unhandled error of our making.
+const pageErrors = consoleErrors
+  .slice(errorsBeforeDwg)
+  .filter((e) => /Unhandled|not a function|undefined is not/i.test(e));
+check(
+  'corrupt DWG does not throw an unhandled error',
+  pageErrors.length === 0,
+  pageErrors.slice(0, 2).join(' | ')
 );
 
 const realFailures = failedRequests.filter((u) => !/favicon/i.test(u));

@@ -34,10 +34,19 @@ npm run preview
 Tests:
 
 ```bash
-npm test                 # geometry unit tests (Node)
-npm run build && npx vite preview --port 4173 &
-node test/e2e.mjs        # full browser run in headless Chromium
+npm test                 # 33 geometry unit tests (Node)
+
+npm run build
+npx vite preview --port 4173 &
+node test/e2e.mjs        # 19 checks in headless Chromium
 ```
+
+The browser run is what proves the pieces Node cannot: that the classic core
+scripts register, that the Web Worker boots and `importScripts()` them, that a
+nest completes with every requested copy placed inside the sheet, that both
+exports download, and that the two WASM readers actually load — a real STEP
+solid must come out at its true 10x10mm size, and a corrupt DWG must produce an
+actionable message rather than an unhandled rejection.
 
 ## How it differs from the desktop app
 
@@ -93,6 +102,11 @@ and hatches are ignored — they are annotation, not cut geometry.
 
 Both WASM readers are dynamically imported, so opening SVG or DXF files never
 downloads them.
+
+No DWG fixture ships with LibreDWG and its WASM build is read-only, so one
+cannot be synthesised here. The browser test therefore covers the part this
+repo owns — that the reader loads and fails legibly — and leaves DWG parsing
+itself to LibreDWG, which is tested upstream.
 
 ### STEP is projected, not unfolded
 
