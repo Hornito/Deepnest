@@ -275,12 +275,6 @@ class WorkerPool {
     }
   }
 
-  clearCaches() {
-    for (const worker of this.workers) {
-      worker.postMessage({ type: 'clear-cache' });
-    }
-  }
-
   terminate() {
     for (const worker of this.workers) {
       worker.terminate();

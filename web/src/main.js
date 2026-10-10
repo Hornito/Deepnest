@@ -150,17 +150,19 @@ function addPartsFromSvg(svgString, filename, meta = {}) {
     return;
   }
 
-  for (const polygon of parts) {
+  parts.forEach((polygon, index) => {
     const bounds = GeometryUtil.getPolygonBounds(polygon);
     state.parts.push({
       id: state.nextPartId++,
-      name: parts.length > 1 ? `${filename} #${state.parts.length + 1}` : filename,
+      // Numbered within the file, not within the list: importing the same
+      // drawing twice should name its parts the same way both times.
+      name: parts.length > 1 ? `${filename} #${index + 1}` : filename,
       polygon,
       children: polygon.children || [],
       bounds,
       quantity: 1,
     });
-  }
+  });
 
   // A STEP solid knows how thick it is, which is almost always the stock
   // thickness. Offer it rather than silently ignoring it.
@@ -438,14 +440,56 @@ function stopNest() {
   ui.stop.disabled = true;
 }
 
+/*
+ * Area of each part in mm², holes excluded, keyed by part id.
+ *
+ * Measured on the part as imported rather than on the spacing-grown polygon
+ * that actually gets placed: utilisation asks how much of the sheet leaves the
+ * machine as parts, and the spacing around them is waste by definition.
+ */
+function partAreaIndexMm2() {
+  const index = new Map();
+  const perMm2 = UNITS_PER_MM * UNITS_PER_MM;
+
+  for (const part of state.parts) {
+    const outer = Math.abs(GeometryUtil.polygonArea(part.polygon));
+    const holes = (part.children || []).reduce(
+      (sum, child) => sum + Math.abs(GeometryUtil.polygonArea(child)),
+      0
+    );
+    index.set(part.id, Math.max(0, outer - holes) / perMm2);
+  }
+
+  return index;
+}
+
+/* Part area landed on each sheet, in mm². */
+function sheetUsageMm2(placement, areaById) {
+  return placement.placements.map((sheet) =>
+    sheet.reduce((sum, entry) => sum + (areaById.get(entry.source) || 0), 0)
+  );
+}
+
 function updateStats(placement, info) {
+  const material = library.selected;
   const sheets = placement.placements.length;
   const placed = placement.placements.reduce((n, s) => n + s.length, 0);
   const total = state.parts.reduce((n, p) => n + p.quantity, 0);
 
+  // Utilisation is the number this whole app exists to move: it is what
+  // decides how much stock a job eats, so it belongs on screen next to the
+  // sheet count rather than left for the user to work out.
+  const sheetArea = material ? material.sheetWidth * material.sheetHeight : 0;
+  const used = sheetUsageMm2(placement, partAreaIndexMm2());
+  const usedTotal = used.reduce((a, b) => a + b, 0);
+  const utilisation =
+    sheetArea > 0 && sheets > 0 ? usedTotal / (sheets * sheetArea) : 0;
+
   ui.stats.innerHTML =
     `<span><strong>${sheets}</strong> sheet${sheets === 1 ? '' : 's'}</span>` +
     `<span><strong>${placed}</strong>/${total} placed</span>` +
+    `<span title="Part area as a share of the sheets used">` +
+    `<strong>${(utilisation * 100).toFixed(1)}%</strong> used</span>` +
     `<span>gen <strong>${info?.generations ?? 0}</strong></span>`;
 }
 
@@ -461,17 +505,25 @@ function renderNest(placement, material) {
 
   const widthMm = material.sheetWidth;
   const heightMm = material.sheetHeight;
+  const sheetArea = widthMm * heightMm;
+
+  // Per sheet, so it is obvious at a glance which ones are worth cutting and
+  // which are the thin tail the nest could not fill.
+  const used = sheetUsageMm2(placement, partAreaIndexMm2());
 
   placement.placements.forEach((sheetPlacements, index) => {
     const wrap = document.createElement('div');
     wrap.className = 'sheet-wrap';
+
+    const utilisation = sheetArea > 0 ? (used[index] / sheetArea) * 100 : 0;
 
     const label = document.createElement('p');
     label.className = 'sheet-label';
     label.textContent =
       `Sheet ${index + 1} — ${material.name}, ` +
       `${formatLength(material.thickness, state.displayUnit)} thick — ` +
-      `${sheetPlacements.length} part${sheetPlacements.length === 1 ? '' : 's'}`;
+      `${sheetPlacements.length} part${sheetPlacements.length === 1 ? '' : 's'}, ` +
+      `${utilisation.toFixed(1)}% used`;
 
     const rings = [];
     for (const p of sheetPlacements) {

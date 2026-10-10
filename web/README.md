@@ -34,19 +34,20 @@ npm run preview
 Tests:
 
 ```bash
-npm test                 # 33 geometry unit tests (Node)
+npm test                 # 37 geometry and worker unit tests (Node)
 
 npm run build
 npx vite preview --port 4173 &
-node test/e2e.mjs        # 19 checks in headless Chromium
+node test/e2e.mjs        # 21 checks in headless Chromium
 ```
 
 The browser run is what proves the pieces Node cannot: that the classic core
 scripts register, that the Web Worker boots and `importScripts()` them, that a
-nest completes with every requested copy placed inside the sheet, that both
-exports download, and that the two WASM readers actually load — a real STEP
-solid must come out at its true 10x10mm size, and a corrupt DWG must produce an
-actionable message rather than an unhandled rejection.
+nest completes with every requested copy placed inside the sheet, that the
+utilisation figure accounts for holes, that both exports download, and that the
+two WASM readers actually load — a real STEP solid must come out at its true
+10x10mm size, and a corrupt DWG must produce an actionable message rather than
+an unhandled rejection.
 
 ## How it differs from the desktop app
 
@@ -67,6 +68,14 @@ SVGnest decomposes holes the same way.
 `test/nfp.test.mjs` checks this against closed-form answers, and asserts the
 property that actually matters: walking a part around the computed NFP, it
 touches the other part but never overlaps it.
+
+The worker caches NFPs by **source**, not by placement instance. Fifty copies
+of one bracket are fifty instances with fifty ids but a single source, and
+every pair of them has the same no-fit polygon — so fifty copies cost two NFPs
+rather than the 1,275 that pairing every instance with every other would.
+`test/worker.test.mjs` measures that by counting calls into `calculateNFP`,
+because the cost is invisible in the output: a wrongly keyed cache still nests
+correctly, just slowly enough to be unusable at the quantities the app is for.
 
 ### Hidden Electron windows became Web Workers
 

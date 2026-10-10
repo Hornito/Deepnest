@@ -195,6 +195,30 @@ check(
 const stats = await page.locator('#nest-stats').textContent();
 check('nest reports statistics', /placed/.test(stats || ''), stats?.trim());
 
+/*
+ * Utilisation is the number a nest is judged on, so check the value and not
+ * just its presence.
+ *
+ * Six 120x80mm plates, each less two 20mm holes, on one 600x400mm sheet:
+ *   6 * (9600 - 2 * ~305) / 240000 = ~22.5%
+ *
+ * The holes are what makes this a real check: counting them as material gives
+ * exactly 24.0%, so the band has to exclude it.
+ */
+const utilisation = Number(/([\d.]+)%/.exec(stats || '')?.[1]);
+check(
+  'utilisation is reported and accounts for holes',
+  utilisation >= 22 && utilisation <= 23.5,
+  `${utilisation}% used (expected ~22.5%; 24.0% would mean holes counted as material)`
+);
+
+const sheetLabel = await page.locator('.sheet-label').first().textContent();
+check(
+  'each sheet reports its own utilisation',
+  /%\s*used/.test(sheetLabel || ''),
+  sheetLabel?.trim()
+);
+
 // --- placements must be inside the sheet and not overlap ----------------
 const geometry = await page.evaluate(() => {
   const svg = document.querySelector('.sheet');

@@ -42,36 +42,70 @@ self.global = { env: {} };
  * generations. Caching them per shape-pair-and-rotation is what makes the
  * whole approach viable.
  *
- * Keyed by source id + rotation rather than by geometry: identical parts share
- * a source id, so a nest of 200 identical brackets computes one NFP, not 200.
+ * Keyed by SOURCE id, not by the placement instance. Ten copies of a bracket
+ * are ten instances with ten distinct ids but a single source, and every pair
+ * of them has the same no-fit polygon - so ten copies cost one NFP rather than
+ * the forty-five that pairing each instance with every other would.
+ *
+ * placePaths still looks NFPs up by instance id, because that is the key it
+ * builds; evaluate() maps those lookups onto the shared entries.
  */
 const nfpCache = new Map();
 
-// Bounded so a long-running nest of many distinct parts cannot grow the cache
-// until the tab is killed. Entries are cheap to recompute relative to the cost
-// of an out-of-memory crash.
-const NFP_CACHE_LIMIT = 20000;
+// The sheet is not a part and carries no source of its own.
+const BIN_SOURCE = -1;
 
-function cacheKey(key) {
-  return `${key.A}/${key.B}/${key.inside ? 1 : 0}/${key.Arotation}/${key.Brotation}`;
+// Bounded so a long-running nest of many distinct parts cannot grow the cache
+// until the tab is killed. Overridable so the tests can drive the eviction path
+// without first allocating twenty thousand no-fit polygons.
+const NFP_CACHE_LIMIT = self.NFP_CACHE_LIMIT || 20000;
+
+// Bumped once per evaluation. Entries the evaluation in flight has touched
+// carry the current epoch, which is what keeps pruneCache off them.
+let epoch = 0;
+
+// Instances carry a source; anything without one is its own source.
+function sourceOf(polygon) {
+  return polygon.source === undefined || polygon.source === null
+    ? polygon.id
+    : polygon.source;
+}
+
+function cacheKey(aSource, bSource, inside, aRotation, bRotation) {
+  return `${aSource}/${bSource}/${inside ? 1 : 0}/${aRotation}/${bRotation}`;
 }
 
 function cacheGet(key) {
-  return nfpCache.get(cacheKey(key));
+  const entry = nfpCache.get(key);
+  if (entry === undefined) {
+    return undefined;
+  }
+  // Touch it: the current evaluation needs this one, so it has to survive.
+  entry.epoch = epoch;
+  return entry.value;
 }
 
 function cacheSet(key, value) {
-  if (nfpCache.size >= NFP_CACHE_LIMIT) {
-    // Drop the oldest quarter. Map iterates in insertion order, so this is a
-    // cheap approximation of LRU without tracking access times.
-    const drop = Math.ceil(NFP_CACHE_LIMIT / 4);
-    let n = 0;
-    for (const k of nfpCache.keys()) {
-      nfpCache.delete(k);
-      if (++n >= drop) break;
+  nfpCache.set(key, { value: value, epoch: epoch });
+}
+
+/*
+ * Drop entries left over from earlier evaluations.
+ *
+ * Only those may go. Evicting an entry the current evaluation still needs does
+ * not merely cost time: placePaths looks the NFP up, misses, and skips that
+ * part altogether - so it vanishes from the nest with no error raised
+ * anywhere. Briefly exceeding the limit is much the better failure.
+ */
+function pruneCache() {
+  if (nfpCache.size <= NFP_CACHE_LIMIT) {
+    return;
+  }
+  for (const [key, entry] of nfpCache) {
+    if (entry.epoch !== epoch) {
+      nfpCache.delete(key);
     }
   }
-  nfpCache.set(cacheKey(key), value);
 }
 
 /*
@@ -82,10 +116,10 @@ function cacheSet(key, value) {
  * sit without hitting one already placed).
  */
 function computeNfp(pair, searchEdges, useHoles) {
-  const A = rotatePolygon(pair.A, pair.key.Arotation);
-  const B = rotatePolygon(pair.B, pair.key.Brotation);
+  const A = rotatePolygon(pair.A, pair.Arotation);
+  const B = rotatePolygon(pair.B, pair.Brotation);
 
-  if (pair.key.inside) {
+  if (pair.inside) {
     // Sheets are rectangles in every material-driven nest, which
     // calculateNFP detects and answers in closed form.
     const nfp = DeepnestNFP.calculateNFP({
@@ -159,6 +193,8 @@ function deserialize(obj) {
 function evaluate(data) {
   const { index, individual, config, sheets } = data;
 
+  epoch++;
+
   const placelist = individual.placement.map(deserialize);
   const rotations = individual.rotation;
 
@@ -176,34 +212,81 @@ function evaluate(data) {
   const searchEdges = !!config.exploreConcave;
   const useHoles = !!config.useHoles;
 
-  // Work out which pairs are missing from the cache. Order matters: a part is
-  // only ever tested against parts placed before it.
+  /*
+   * Work out what geometry this candidate needs.
+   *
+   * Two lists come out of it, because two different things are being keyed:
+   *
+   *   - `pending` is the NFPs still to compute, one per distinct SOURCE pair.
+   *     Copies of one part collapse into a single entry here.
+   *   - `plan` is every lookup placePaths will make, one per placement
+   *     INSTANCE pair, each pointing at the shared cache entry that answers it.
+   *
+   * Order matters: a part is only ever tested against parts placed before it.
+   */
   const pending = [];
+  const queued = new Set();
+  const plan = [];
+
   for (let i = 0; i < placelist.length; i++) {
     const part = placelist[i];
+    const partSource = sourceOf(part);
 
-    const binKey = {
-      A: -1,
-      B: part.id,
-      inside: true,
-      Arotation: 0,
-      Brotation: rotations[i],
-    };
-    if (cacheGet(binKey) === undefined) {
-      pending.push({ A: binPolygon, B: part, key: binKey });
+    const binKey = cacheKey(BIN_SOURCE, partSource, true, 0, rotations[i]);
+    plan.push({
+      lookup: JSON.stringify({
+        A: -1,
+        B: part.id,
+        inside: true,
+        Arotation: 0,
+        Brotation: rotations[i],
+      }),
+      key: binKey,
+    });
+
+    if (cacheGet(binKey) === undefined && !queued.has(binKey)) {
+      queued.add(binKey);
+      pending.push({
+        A: binPolygon,
+        B: part,
+        key: binKey,
+        inside: true,
+        Arotation: 0,
+        Brotation: rotations[i],
+      });
     }
 
     for (let j = 0; j < i; j++) {
       const placed = placelist[j];
-      const pairKey = {
-        A: placed.id,
-        B: part.id,
-        inside: false,
-        Arotation: rotations[j],
-        Brotation: rotations[i],
-      };
-      if (cacheGet(pairKey) === undefined) {
-        pending.push({ A: placed, B: part, key: pairKey });
+      const pairKey = cacheKey(
+        sourceOf(placed),
+        partSource,
+        false,
+        rotations[j],
+        rotations[i]
+      );
+
+      plan.push({
+        lookup: JSON.stringify({
+          A: placed.id,
+          B: part.id,
+          inside: false,
+          Arotation: rotations[j],
+          Brotation: rotations[i],
+        }),
+        key: pairKey,
+      });
+
+      if (cacheGet(pairKey) === undefined && !queued.has(pairKey)) {
+        queued.add(pairKey);
+        pending.push({
+          A: placed,
+          B: part,
+          key: pairKey,
+          inside: false,
+          Arotation: rotations[j],
+          Brotation: rotations[i],
+        });
       }
     }
   }
@@ -231,36 +314,15 @@ function evaluate(data) {
     }
   }
 
-  // placePaths reads the cache with JSON.stringify'd keys, so hand it a plain
-  // object built in that shape rather than our Map.
+  // placePaths reads the cache with JSON.stringify'd instance keys, so hand it
+  // a plain object in that shape. Every instance pair that shares a source
+  // points at the same NFP; placePaths only ever reads them, so the sharing is
+  // safe as well as free.
   const cacheForPlacement = {};
-  for (let i = 0; i < placelist.length; i++) {
-    const part = placelist[i];
-
-    const binKey = {
-      A: -1,
-      B: part.id,
-      inside: true,
-      Arotation: 0,
-      Brotation: rotations[i],
-    };
-    const binNfp = cacheGet(binKey);
-    if (binNfp) {
-      cacheForPlacement[JSON.stringify(binKey)] = binNfp;
-    }
-
-    for (let j = 0; j < i; j++) {
-      const pairKey = {
-        A: placelist[j].id,
-        B: part.id,
-        inside: false,
-        Arotation: rotations[j],
-        Brotation: rotations[i],
-      };
-      const pairNfp = cacheGet(pairKey);
-      if (pairNfp) {
-        cacheForPlacement[JSON.stringify(pairKey)] = pairNfp;
-      }
+  for (const entry of plan) {
+    const nfp = cacheGet(entry.key);
+    if (nfp) {
+      cacheForPlacement[entry.lookup] = nfp;
     }
   }
 
@@ -277,6 +339,10 @@ function evaluate(data) {
 
   const placement = worker.placePaths(placelist.slice(0));
 
+  // Now that nothing is reading the cache, entries from earlier candidates can
+  // go if we are over budget.
+  pruneCache();
+
   self.postMessage({ type: 'progress', index, progress: 1 });
 
   return placement;
@@ -284,11 +350,6 @@ function evaluate(data) {
 
 self.onmessage = (event) => {
   const data = event.data;
-
-  if (data.type === 'clear-cache') {
-    nfpCache.clear();
-    return;
-  }
 
   if (data.type !== 'nest') {
     return;
